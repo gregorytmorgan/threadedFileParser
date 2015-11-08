@@ -1,16 +1,16 @@
-#!/usr/bin/perl 
+#!/usr/bin/perl
 #
 # @author Greg Morgan
 # @version 0.1
 #
-# Parse a test file
+# Threaded file parser.
 #
 
 use strict;
 use warnings;
+
 use threads;
-use POSIX qw(ceil floor);
-use Data::Dumper;
+use POSIX qw(floor);
 
 use Config;
 $Config{useithreads} or die('Recompile Perl with threads to run this program.');
@@ -26,26 +26,28 @@ my $totalBytes = 0;
 my @workers;
 my $nThreads = 3;
 my $offset;
-my $remainder;
 
 print "Workers: $nThreads\n";
 
 if ($filename) {
-	my @stat = stat $filename;
+	my @stat = stat $filename or die "Could open input file filename. $!\n";
 	$filesize = $stat[7];
+
 } else {
-	$filesize = -1;
+	die "No input file specified\n";
 }
 
 print "Filesize: $filesize bytes.\n";
 
 $offset = floor($filesize / $nThreads);
-$remainder = $filesize % $nThreads;
 
+#
+# Create worker threads
+#
 for my $i (0 .. $nThreads - 1) {
+	my $startOffset = floor($i * $offset);
 
-	my $startOffset = floor($i * $offset); # -1 since zero based
-
+	# the last worker handles to EOF to cover remainder bytes
 	if ($i == ($nThreads - 1)) {
 		$offset = 0;
 	}
@@ -53,6 +55,9 @@ for my $i (0 .. $nThreads - 1) {
 	push @workers, threads->create(\&pWorker, $i, $filename, $startOffset, $offset);
 }
 
+#
+# Aggregate worker results
+#
 foreach (@workers) {
 	my $worker = $_;
 	my @returnData = $worker->join();
@@ -66,37 +71,41 @@ print "Done. Totals: Parsed $totalLines lines, $totalBytes bytes.\n";
 # Given a start offset into file, move backwards until begin of line, then read
 # lines while not exceeding maxBytes.
 #
+# @param {integer} Thread id.
+# @param {string} Input filename.
+# @param {integer} Start byte offset for this worker.
+# @param {integer} Max bytes to process.
+# @return {array} [totalLines, totalBytes]
 sub pWorker {
 	my @args = @_;
 	my $n = 0;
 	my $t_id = $args[0];
 	my $filename = $args[1];
-	my $readOffset = $args[2];
-	my $maxOffset = $args[3];
-	my $tmp;
-	my $charsRead = 0;
+	my $startOffset = $args[2];
+	my $maxBytes = $args[3];
+	my $data;
 	my $bytesSkipped = 0;
 	my $bytesProcessed = 0;
 
-	print "$t_id, In thread $t_id\n";
+	print "$t_id In thread $t_id\n";
+	print "$t_id Initial offset (bytes): $startOffset\n";
+	print "$t_id Max bytes: $maxBytes\n";
 
-	print "$t_id, Initial offset (bytes): $readOffset\n";
-	print "$t_id, Max offset (bytes): $maxOffset\n";
+	open my $infile, '<', $filename or die "$t_id File open for $filename failed. !$\n";
 
-	open my $infile, '<', $filename or die "$t_id, File open for $filename failed. !$\n";
+	if ($startOffset != 0) {
+		seek($infile, $startOffset, 0); # offset bytes, 0 = SEEK_SET
 
-	if ($readOffset != 0) {
-		seek($infile, $readOffset, 0); # offset bytes, 0 = SEEK_SET
-
-		while ((read($infile, $tmp, 1) != 0))
+		# find he beginning of the current line
+		while ((read($infile, $data, 1) != 0))
 		{
-			print "$t_id, Read char $tmp @ byte " . tell($infile) . "\n";
+			print "$t_id Read byte " . tell($infile) . "\n";
 
-			use bytes;
-			$bytesSkipped += length($tmp);
+			use bytes; # config length() to return bytes not chars
+			$bytesSkipped += length($data);
 
-			if ($tmp eq "\n" && $bytesSkipped > 1) {
-				print "$t_id, Found endline\n";
+			if ($data eq "\n" && $bytesSkipped > 1) {
+				print "$t_id Found endline @ byte " . tell($infile) . "\n";
 				last;
 			}
 
@@ -105,22 +114,28 @@ sub pWorker {
 		}
 	}
 
-	print "$t_id, Starting line reads @ byte " . tell($infile) . "\n";
+	print "$t_id Starting line reads @ byte " . tell($infile) . "\n";
 
+	# read lines up until maxBytes
 	while (my $line = <$infile>) {
-		use bytes;
+		use bytes; # config length() to return bytes not chars
 		$bytesProcessed += length($line);
 
-		if ($maxOffset && $bytesProcessed > $maxOffset) {
+		if ($maxBytes && $bytesProcessed > $maxBytes) {
 			$bytesProcessed -= length($line);
 			last;
 		}
 
 		$n++;
-		print "$t_id, Line $n: $line";
+
+		#
+		# Do some work
+		#
+
+		print "$t_id Line $n: $line";
 	}
 
-	print "$t_id, Thread complete.  Parsed $n lines, $bytesProcessed bytes.\n";
+	print "$t_id Thread complete.  Parsed $n lines, $bytesProcessed bytes.\n";
 
 	close($infile);
 
