@@ -1,3 +1,10 @@
+#!/usr/bin/perl 
+#
+# @author Greg Morgan
+# @version 0.1
+#
+# Parse a test file
+#
 
 use strict;
 use warnings;
