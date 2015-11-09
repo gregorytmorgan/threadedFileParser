@@ -11,28 +11,30 @@ use warnings;
 
 use threads;
 use POSIX qw(floor);
+use File::Temp;
 
 use Config;
 $Config{useithreads} or die('Recompile Perl with threads to run this program.');
 
-my $infile = \*STDIN;
-my $outfile = \*STDOUT;
+my $outFileName = "result.txt";
+#my $outFileName = "STDOUT";
+
+my $inFileName = "testData.txt";
+#my $inFileName = "testData.2.txt";
 
 my $filesize;
-#my $filename = "testData.txt";
-my $filename = "testData.2.txt";
 my $totalLines = 0;
 my $totalBytes = 0;
 my @workers;
 my $nThreads = 3;
 my $offset;
+my @outTempFiles;
 
 print "Workers: $nThreads\n";
 
-if ($filename) {
-	my @stat = stat $filename or die "Could open input file filename. $!\n";
+if ($inFileName) {
+	my @stat = stat $inFileName or die "Could open input file inFileName. $!\n";
 	$filesize = $stat[7];
-
 } else {
 	die "No input file specified\n";
 }
@@ -52,7 +54,7 @@ for my $i (0 .. $nThreads - 1) {
 		$offset = 0;
 	}
 
-	push @workers, threads->create(\&pWorker, $i, $filename, $startOffset, $offset);
+	push @workers, threads->create(\&pWorker, $i, $inFileName, $startOffset, $offset * ($i + 1));
 }
 
 #
@@ -63,16 +65,31 @@ foreach (@workers) {
 	my @returnData = $worker->join();
 	$totalLines += $returnData[0];
 	$totalBytes += $returnData[1];
+	push @outTempFiles, $returnData[2];
 }
 
-print "Done. Totals: Parsed $totalLines lines, $totalBytes bytes.\n";
+print "Summary: Parsed $totalLines lines, $totalBytes bytes.\n";
+
+foreach my $file (@outTempFiles) {
+	if ($outFileName eq "STDOUT") {
+		open my $fh, '<', $file or die "File open for $file failed. !$\n";
+		while (my $line = <$fh>) {
+			print STDOUT $line;
+		}
+	} else {
+		system qq( cat "$file" >> "$outFileName" );
+	}
+	unlink $file or warn "Could not unlink $file: $!";
+}
+
+print "\nDone.\n";
 
 #
 # Given a start offset into file, move backwards until begin of line, then read
-# lines while not exceeding maxBytes.
+# lines while not exceeding maxOffset.
 #
 # @param {integer} Thread id.
-# @param {string} Input filename.
+# @param {string} Input inFileName.
 # @param {integer} Start byte offset for this worker.
 # @param {integer} Max bytes to process.
 # @return {array} [totalLines, totalBytes]
@@ -80,18 +97,29 @@ sub pWorker {
 	my @args = @_;
 	my $n = 0;
 	my $t_id = $args[0];
-	my $filename = $args[1];
+	my $inFileName = $args[1];
 	my $startOffset = $args[2];
-	my $maxBytes = $args[3];
+	my $maxOffset = $args[3];
 	my $data;
 	my $bytesSkipped = 0;
 	my $bytesProcessed = 0;
 
 	print "$t_id In thread $t_id\n";
 	print "$t_id Initial offset (bytes): $startOffset\n";
-	print "$t_id Max bytes: $maxBytes\n";
+	print "$t_id Max bytes: $maxOffset\n";
 
-	open my $infile, '<', $filename or die "$t_id File open for $filename failed. !$\n";
+    my $tmpFile = File::Temp->new(
+        TEMPLATE => 'tempXXXXX',
+        DIR => '.',
+        SUFFIX => '.tmp',
+		UNLINK => 0
+    );
+
+	open my $tmpOutFile, ">", $tmpFile->filename or die "Couldn't open temp file - " . $tmpFile->filename . ": $!";
+
+	print "$t_id Temp file: " . $tmpFile->filename . "\n";
+
+	open my $infile, '<', $inFileName or die "$t_id File open for $inFileName failed. !$\n";
 
 	if ($startOffset != 0) {
 		seek($infile, $startOffset, 0); # offset bytes, 0 = SEEK_SET
@@ -99,7 +127,8 @@ sub pWorker {
 		# find he beginning of the current line
 		while ((read($infile, $data, 1) != 0))
 		{
-			print "$t_id Read byte " . tell($infile) . "\n";
+			my $b = ($data eq "\n") ? "NEWLINE" : $data;
+			print "$t_id Read byte $b, now @ byte " . tell($infile) . "\n";
 
 			use bytes; # config length() to return bytes not chars
 			$bytesSkipped += length($data);
@@ -116,12 +145,13 @@ sub pWorker {
 
 	print "$t_id Starting line reads @ byte " . tell($infile) . "\n";
 
-	# read lines up until maxBytes
+	# read lines up until maxOffset
 	while (my $line = <$infile>) {
 		use bytes; # config length() to return bytes not chars
 		$bytesProcessed += length($line);
 
-		if ($maxBytes && $bytesProcessed > $maxBytes) {
+		if ($maxOffset && (tell($infile) - 1) >= $maxOffset) {
+			print "$t_id Breaking at " . (tell($infile) - 1) . " after reading $bytesProcessed bytes\n";
 			$bytesProcessed -= length($line);
 			last;
 		}
@@ -131,15 +161,15 @@ sub pWorker {
 		#
 		# Do some work
 		#
-
-		print "$t_id Line $n: $line";
+		print $tmpOutFile "$t_id Line $n: $line";
 	}
 
 	print "$t_id Thread complete.  Parsed $n lines, $bytesProcessed bytes.\n";
 
+	close($tmpOutFile);
 	close($infile);
 
-	return ($n, $bytesProcessed);
+	return ($n, $bytesProcessed, $tmpFile->filename);
 }
 
 # end file
