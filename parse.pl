@@ -5,6 +5,10 @@
 #
 # Threaded file parser.
 #
+# ToDO
+#   - Addrss stdin input
+#	- Add command line options.
+#
 
 use strict;
 use warnings;
