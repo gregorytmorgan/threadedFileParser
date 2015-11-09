@@ -151,7 +151,7 @@ sub pWorker {
 		$bytesProcessed += length($line);
 
 		if ($maxOffset && (tell($infile) - 1) >= $maxOffset) {
-			print "$t_id Breaking at " . (tell($infile) - 1) . " after reading $bytesProcessed bytes\n";
+			print "$t_id Breaking at " . tell($infile) . " after reading $bytesProcessed bytes\n";
 			$bytesProcessed -= length($line);
 			last;
 		}
