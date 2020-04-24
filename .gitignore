@@ -1,1 +1,10 @@
+#
+#
+#  
 /nbproject
+
+# test files
+*.jpg
+*.data
+
+# end file
