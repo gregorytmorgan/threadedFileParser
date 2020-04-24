@@ -1,9 +1,11 @@
 #!/usr/bin/perl
 #
-# Threaded file parser.
+# Multi process file parser.
 #
-# Open a file and use n threads to read/evaluate approx equal parts. Output the
-# each part to file.  Concatenate call the file parts to form the result
+# https://perlmaven.com/speed-up-calculation-by-running-in-parallel
+#
+# Open a file and use n processes to read/evaluate approx equal parts. Output
+# each part to file.  Concatenate call the file parts to form the result.
 #
 # If input is multiple files, processing blocks between files.
 #
@@ -11,11 +13,11 @@
 use strict;
 use warnings;
 
-use threads;
 use POSIX qw(floor);
 use File::Temp;
 use Time::HiRes qw( time );
 use Number::Format qw(format_bytes format_number);
+use Parallel::ForkManager;
 
 use Config;
 $Config{useithreads} or die('Recompile Perl with threads to run this program.');
@@ -35,7 +37,7 @@ my @fileList;
 my $filesize;
 my $totalLines = 0;
 my $totalBytes = 0;
-my $nThreads = 4;
+my $nWorkers = 4;
 my $offset;
 my @outTempFiles;
 my $debug = 0;
@@ -90,8 +92,23 @@ if ($opt{o}) {
 }
 
 if (!$opt{q}) {
-    print STDOUT "Workers: $nThreads\n";
+    print STDOUT "Workers: $nWorkers\n";
 }
+
+#
+# setup
+#
+
+# by default Parallel::ForkManager writes /tmp but this erroring for some reason
+my $pm = Parallel::ForkManager->new($nWorkers, '/home/gmorgan/dev/threadedFileParser');
+
+# To return data a callback is used. Not necessary in this application
+#$pm->run_on_finish( sub {
+#    my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_structure_reference) = @_;
+#    my $q = $data_structure_reference->{input};
+#    $results{$q} = $data_structure_reference->{result};
+#    print "All done $pid\n";
+#});
 
 #
 # for each input file
@@ -111,47 +128,41 @@ foreach my $file (@fileList) {
         print "Filesize: " . format_bytes($filesize, precision => 2) . " bytes.\n";
     }
 
-    my @workers;
-    $offset = floor($filesize / $nThreads);
+    $offset = floor($filesize / $nWorkers);
+    my $parse_begin_time = time();
 
     #
     # Create worker processes
     #
-    for my $i (0 .. $nThreads - 1) {
+    for my $i (0 .. $nWorkers - 1) {
         my $startOffset = floor($i * $offset);
 
         # the last worker handles to EOF to cover remainder bytes
-        if ($i == ($nThreads - 1)) {
+        if ($i == ($nWorkers - 1)) {
             $offset = 0;
         }
 
-        my $t_id = sprintf("%02d", ($t_id * $nThreads) + $i);
+        my $t_id = sprintf("%02d", ($t_id * $nWorkers) + $i);
 
-        push @workers, threads->create(\&pWorker, $t_id, $file, $startOffset, $offset * ($i + 1));
+        my $tmpFile = File::Temp->new(
+            TEMPLATE => $t_id . 'tempXXXXX',
+            DIR => '.',
+            SUFFIX => '.tmp',
+            UNLINK => 0
+        );
+
+        push @outTempFiles, $tmpFile->filename;
+
+        my $pid = $pm->start and next;
+        my $result = pWorker($t_id, $file, $startOffset, $offset * ($i + 1), $tmpFile->filename);
+        $pm->finish(0, { result => $result }); # , input => $q
     }
 
-    my $parse_begin_time = time();
-
-    #
-    # Aggregate worker results
-    #
-    foreach (@workers) {
-        my $worker = $_;
-        my @returnData = $worker->join();
-        $totalLines += $returnData[0];
-        $totalBytes += $returnData[1];
-        push @outTempFiles, $returnData[2];
-    }
-
-    # at this point all threads are joined/complete
-    undef @workers;
+    $pm->wait_all_children;
 
     if (!$opt{q}) {
         printf("Parse complete: Parsed %s lines, %s bytes in %.5f seconds. Reassembling ...\n", format_number($totalLines), format_bytes($totalBytes), time() - $parse_begin_time);
     }
-
-    # tmp file to cleanup
-    my @tmpfiles = ();
 
     my $reassembly_begin_time = time();
 
@@ -208,6 +219,7 @@ sub pWorker {
 	my $inFileName = $args[1];
 	my $startOffset = $args[2];
 	my $maxOffset = $args[3];
+    my $outFileName = $args[4];
 	my $data;
 	my $bytesSkipped = 0;
 	my $bytesProcessed = 0;
@@ -218,17 +230,10 @@ sub pWorker {
         print "$t_id Max bytes: " . format_number($maxOffset) . "\n";
     }
 
-    my $tmpFile = File::Temp->new(
-        TEMPLATE => $t_id . 'tempXXXXX',
-        DIR => '.',
-        SUFFIX => '.tmp',
-		UNLINK => 0
-    );
-
-	open my $tmpOutFile, ">", $tmpFile->filename or die "Couldn't open temp file - " . $tmpFile->filename . ": $!";
+	open my $tmpOutFile, ">", $outFileName or die "Couldn't open temp file - " . $outFileName . ": $!";
 
     if (!$opt{q}) {
-        print "$t_id Temp file: " . $tmpFile->filename . "\n";
+        print "$t_id Temp file: " . $outFileName . "\n";
     }
 
 	open my $infile, '<', $inFileName or die "$t_id File open for $inFileName failed. !$\n";
@@ -294,13 +299,14 @@ sub pWorker {
     if (!$opt{q}) {
         my $tstamp = localtime();
         my $thread_elasped_time = time() - $thread_parse_begin_time;
-        printf("%s Thread completed at %s. Parsed %s lines, %s bytes in %.5f seconds.\n", $t_id, $tstamp, format_number($n), format_bytes($bytesProcessed), $thread_elasped_time);
+        printf("%s Worker finished at %s. Parsed %s lines, %s bytes in %.5f seconds.\n", $t_id, $tstamp, format_number($n), format_bytes($bytesProcessed), $thread_elasped_time);
     }
 
 	close($tmpOutFile);
 	close($infile);
 
-	return ($n, $bytesProcessed, $tmpFile->filename);
+    # currently the finish callback isn't working. Fairly certain it will, just haven't looked at it
+	return ($n, $bytesProcessed, $outFileName);
 }
 
 # end file
